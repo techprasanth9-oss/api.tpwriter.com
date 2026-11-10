@@ -1,6 +1,10 @@
 import { Schema, model, type Model, type Types } from "mongoose";
 
 /**
+ * LEGACY (v1) — no longer written. v2 documents store blocks in
+ * `DocumentBlock`; this model is kept so src/migrations/v2.ts can read old
+ * pages, and the rows are left in place after migration for rollback safety.
+ *
  * One physical page of a document. Mirrors the eSigns pattern where each
  * page's EditorJS `OutputData` lives in its own row, keyed back to the
  * parent document. Keeps a single page's write cost small even when the
