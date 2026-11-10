@@ -20,6 +20,10 @@ pnpm dev
 
 API listens on `http://localhost:${PORT:-3001}`.
 
+No database handy? `pnpm dev:memory` runs the API against a throwaway
+in-memory MongoDB (nothing persists; your `.env` URI is not used). The
+frontend's browser tests use it too.
+
 ## Document model
 
 **v2 (current).** A document is one Editor.js block list; pagination is
