@@ -10,11 +10,15 @@ import {
   signSession,
 } from "../auth/jwt";
 import { requireAuth, type AuthContext } from "../auth/middleware";
+import { rateLimit } from "../middleware/rateLimit";
 import { LoginInput, SignupInput } from "../schemas/auth";
 
 export const auth = new Hono<AuthContext>();
 
-auth.post("/signup", vValidator("json", SignupInput), async (c) => {
+const loginLimit = rateLimit({ name: "login", windowMs: 15 * 60_000, max: 10 });
+const signupLimit = rateLimit({ name: "signup", windowMs: 60 * 60_000, max: 5 });
+
+auth.post("/signup", signupLimit, vValidator("json", SignupInput), async (c) => {
   const { email, password, displayName } = c.req.valid("json");
 
   const existing = await User.exists({ email });
@@ -25,7 +29,12 @@ auth.post("/signup", vValidator("json", SignupInput), async (c) => {
     email,
     passwordHash,
     displayName: displayName ?? null,
+  }).catch((err: { code?: number }) => {
+    // Lost a race with a concurrent signup for the same email.
+    if (err.code === 11000) return null;
+    throw err;
   });
+  if (!created) return c.json({ error: "email_taken" }, 409);
 
   setSessionCookieOn(
     c,
@@ -34,7 +43,7 @@ auth.post("/signup", vValidator("json", SignupInput), async (c) => {
   return c.json(toPublic(created), 201);
 });
 
-auth.post("/login", vValidator("json", LoginInput), async (c) => {
+auth.post("/login", loginLimit, vValidator("json", LoginInput), async (c) => {
   const { email, password } = c.req.valid("json");
 
   const user = await User.findOne({ email });
