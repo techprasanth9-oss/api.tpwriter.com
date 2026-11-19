@@ -56,6 +56,7 @@ documents.post("/", vValidator("json", CreateDocumentInput), async (c) => {
     revision: 1,
     blockOrder: [],
     styles: {},
+    pageSetup: {},
   });
 
   // A fresh doc has no blocks; the FE's editor starts from an empty list.
@@ -90,6 +91,7 @@ documents.patch(
     if (patch.headerBlocks !== undefined) $set.headerBlocks = patch.headerBlocks;
     if (patch.footerBlocks !== undefined) $set.footerBlocks = patch.footerBlocks;
     if (patch.styles !== undefined) $set.styles = patch.styles;
+    if (patch.pageSetup !== undefined) $set.pageSetup = patch.pageSetup;
 
     const updated = await DocumentModel.findOneAndUpdate(
       { _id: doc._id, ownerId: session.userId },
@@ -348,6 +350,7 @@ function toMetaResponse(doc: DocumentDoc) {
     headerBlocks: doc.headerBlocks ?? [],
     footerBlocks: doc.footerBlocks ?? [],
     styles: doc.styles ?? {},
+    pageSetup: doc.pageSetup ?? {},
     createdAt: doc.createdAt.toISOString(),
     updatedAt: doc.updatedAt.toISOString(),
   };

@@ -52,6 +52,7 @@ describe("documents v2", () => {
       revision: 1,
       blocks: [],
       styles: {},
+      pageSetup: {},
       headerBlocks: [],
       footerBlocks: [],
     });
@@ -287,6 +288,7 @@ describe("documents v2", () => {
       title: "Renamed",
       defaultLayout: { orientation: "landscape" },
       styles: { heading1: { fontSize: 32 } },
+      pageSetup: { differentFirstPage: true, footnotes: { f1: "Note" } },
       headerBlocks: [para("h", "Header")],
     });
     expect(res.status).toBe(200);
@@ -297,6 +299,7 @@ describe("documents v2", () => {
       title: "Renamed",
       revision: 2,
       styles: { heading1: { fontSize: 32 } },
+      pageSetup: { differentFirstPage: true, footnotes: { f1: "Note" } },
       headerBlocks: [para("h", "Header")],
     });
     // Partial layout patch merges onto the existing layout.
@@ -312,6 +315,7 @@ describe("documents v2", () => {
         "footerBlocks",
         "headerBlocks",
         "id",
+        "pageSetup",
         "revision",
         "styles",
         "title",

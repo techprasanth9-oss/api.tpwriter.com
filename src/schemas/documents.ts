@@ -43,6 +43,8 @@ export const UpdateDocumentInput = v.object({
   footerBlocks: v.optional(v.array(v.unknown())),
   // Doc-level named styles; opaque to the server.
   styles: v.optional(v.record(v.string(), v.unknown())),
+  // Headers/footers, page decoration, footnotes; opaque to the server.
+  pageSetup: v.optional(v.record(v.string(), v.unknown())),
 });
 
 /** Incremental content save. Cross-field rules (unique ids, upsert/delete

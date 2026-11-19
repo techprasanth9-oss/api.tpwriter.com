@@ -71,6 +71,9 @@ export interface DocumentDoc {
   blockOrder: string[];
   // Doc-level named styles. Opaque to the server; the FE owns the shape.
   styles: Record<string, unknown>;
+  // Headers/footers, page decoration and footnote texts. Opaque to the
+  // server; the FE validates and owns the shape.
+  pageSetup: Record<string, unknown>;
   // Legacy (v1) only: ordered DocumentPage ids. Unused for v2 docs.
   pageIds: Types.ObjectId[];
   defaultLayout: PageLayout;
@@ -102,6 +105,7 @@ const documentSchema = new Schema<DocumentDoc>(
     revision: { type: Number },
     blockOrder: { type: [String], default: [] },
     styles: { type: Schema.Types.Mixed, default: () => ({}) },
+    pageSetup: { type: Schema.Types.Mixed, default: () => ({}) },
     pageIds: [
       {
         type: Schema.Types.ObjectId,
