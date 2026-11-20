@@ -52,6 +52,33 @@ for rollback.
 
 Transactions require MongoDB running as a replica set (Atlas always is).
 
+## PDF export
+
+`POST /documents/:id/pdf` returns the document as `application/pdf`,
+rendered exactly as the editor paginates it: headless Chromium
+(`playwright-core`) opens the frontend's print route
+`${APP_URL}/documents/:id/print` with the caller's session cookie, waits for
+the page to set `window.__TP_PRINT_READY__`, and prints with the page's own
+`@page` sizes (mixed paper sizes / orientations come out per page).
+`GET /pdf/status` answers `200 { enabled: true }` or `501` so the frontend
+can hide the option.
+
+- `APP_URL` (required to enable it) — the frontend's public URL. Unset →
+  `501 { error: "pdf_not_configured" }`.
+- `API_PUBLIC_URL` — the URL the frontend calls this API on, when it's a
+  different origin from `APP_URL`; the session cookie is set for it too.
+- `CHROMIUM_PATH` — browser binary. Unset → playwright-core's default
+  install location (`npx playwright-core install chromium`; on Linux also
+  `npx playwright-core install-deps chromium`).
+- `PDF_CONCURRENCY` — simultaneous renders (default 2).
+
+Ownership is checked like every document route (404 for other users'
+docs), renders are limited to 10/min per user (429), and a render that
+doesn't finish in 30 s answers 504. One browser is shared across requests
+(launched on first use); each render runs in a fresh context that may only
+load `APP_URL` / `API_PUBLIC_URL` and Google Fonts — every other request is
+blocked, and no URL comes from the request.
+
 ## Tests
 
 ```bash

@@ -30,6 +30,23 @@ if (isProd && CORS_ORIGINS.includes("*")) {
   );
 }
 
+/** Optional absolute http(s) URL, normalised to its origin + path without
+ *  a trailing slash. Refuses to boot on a malformed value. */
+function optionalUrl(name: string): string | undefined {
+  const v = process.env[name]?.trim();
+  if (!v) return undefined;
+  let url: URL;
+  try {
+    url = new URL(v);
+  } catch {
+    throw new Error(`[env] ${name} must be an absolute URL (got "${v}").`);
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error(`[env] ${name} must be an http(s) URL.`);
+  }
+  return `${url.origin}${url.pathname}`.replace(/\/+$/, "");
+}
+
 export const env = {
   MONGODB_URI: required("MONGODB_URI"),
   JWT_SECRET,
@@ -40,4 +57,18 @@ export const env = {
   // Set when the API runs behind a reverse proxy / load balancer that sets
   // X-Forwarded-For. Used by the rate limiter to find the real client IP.
   TRUST_PROXY: process.env.TRUST_PROXY === "true",
+  // ── Server-side PDF export (POST /documents/:id/pdf) ──────────────────
+  // Public URL of the frontend. The renderer opens
+  // `${APP_URL}/documents/:id/print` in headless Chromium with the
+  // caller's session cookie. Unset → the endpoint answers 501.
+  APP_URL: optionalUrl("APP_URL"),
+  // Public URL the frontend uses to reach this API, when it's on another
+  // origin than APP_URL (VITE_API_URL). The session cookie is also set for
+  // it, and it's allowed in the renderer's request allowlist.
+  API_PUBLIC_URL: optionalUrl("API_PUBLIC_URL"),
+  // Chromium / Chrome binary for the renderer; unset → playwright-core's
+  // default browser location (`npx playwright-core install chromium`).
+  CHROMIUM_PATH: process.env.CHROMIUM_PATH?.trim() || undefined,
+  // Concurrent renders (each is a browser tab).
+  PDF_CONCURRENCY: Math.max(1, Number(process.env.PDF_CONCURRENCY ?? 2) || 2),
 };

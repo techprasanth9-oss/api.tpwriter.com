@@ -7,6 +7,7 @@ import { secureHeaders } from "hono/secure-headers";
 import { env } from "./env";
 import { auth } from "./routes/auth";
 import { documents } from "./routes/documents";
+import { createPdfRoutes } from "./routes/pdf";
 import { uploads, UPLOAD_BODY_LIMIT } from "./routes/uploads";
 
 // Block JSON can carry inline (base64) images until every image goes through
@@ -67,6 +68,8 @@ export function createApp() {
 
   app.route("/auth", auth);
   app.route("/documents", documents);
+  // GET /pdf/status, POST /documents/:id/pdf
+  app.route("/", createPdfRoutes());
   app.route("/uploads", uploads);
 
   app.notFound((c) => c.json({ error: "not_found" }, 404));
