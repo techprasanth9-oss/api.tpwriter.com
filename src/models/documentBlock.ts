@@ -8,6 +8,13 @@ import { Schema, model, type Model, type Types } from "mongoose";
  *
  * `blockId` is the Editor.js block id, unique per document — the client
  * addresses blocks by it, so it's the upsert key for content saves.
+ *
+ * Phase 6: `rev` is the document revision that last wrote the row, and a
+ * deleted block is kept as a tombstone (`deleted: true`, data cleared) so
+ * GET /documents/:id/changes can report deletes and concurrent saves can be
+ * merged block by block. Rows written before Phase 6 have neither field:
+ * a missing `rev` reads as 0, a missing `deleted` as false. Tombstones are
+ * purged ~500 revisions later (see routes/documents.ts).
  */
 
 export interface DocumentBlockDoc {
@@ -22,6 +29,8 @@ export interface DocumentBlockDoc {
   // its own keys without a schema migration here.
   data: Record<string, unknown>;
   tunes: Record<string, unknown> | null;
+  rev?: number;
+  deleted?: boolean;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -43,6 +52,8 @@ const blockSchema = new Schema<DocumentBlockDoc>(
     type: { type: String, required: true },
     data: { type: Schema.Types.Mixed, default: () => ({}) },
     tunes: { type: Schema.Types.Mixed, default: null },
+    rev: { type: Number },
+    deleted: { type: Boolean },
   },
   {
     timestamps: true,
@@ -54,6 +65,8 @@ const blockSchema = new Schema<DocumentBlockDoc>(
 
 // Upsert key for content saves; also serves "all blocks of a document".
 blockSchema.index({ documentId: 1, blockId: 1 }, { unique: true });
+// Changes feed ("everything after revision R") and tombstone GC.
+blockSchema.index({ documentId: 1, rev: 1 });
 
 export const DocumentBlock: Model<DocumentBlockDoc> = model<DocumentBlockDoc>(
   "DocumentBlock",

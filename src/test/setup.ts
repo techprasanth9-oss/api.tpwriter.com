@@ -5,6 +5,9 @@ import { DocumentModel } from "../models/document";
 import { DocumentBlock } from "../models/documentBlock";
 import { DocumentPage } from "../models/documentPage";
 import { User } from "../models/user";
+import { DocumentVersion } from "../models/documentVersion";
+import { CommentThread } from "../models/commentThread";
+import { Notification } from "../models/notification";
 
 /**
  * Per-test-file Mongo: an in-memory single-node replica set (transactions
@@ -27,7 +30,7 @@ beforeAll(async () => {
   // Create collections + indexes up front: catalog changes racing with the
   // first transaction can fail it.
   await Promise.all(
-    [DocumentModel, DocumentBlock, DocumentPage, User].map(async (m) => {
+    [DocumentModel, DocumentBlock, DocumentPage, User, DocumentVersion, CommentThread, Notification].map(async (m) => {
       await m.createCollection();
       await m.syncIndexes();
     }),

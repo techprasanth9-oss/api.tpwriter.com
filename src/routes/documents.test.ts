@@ -114,7 +114,12 @@ describe("documents v2", () => {
     got = await api(alice, "GET", `/documents/${id}`);
     expect(got.body.blocks.map((b: { id: string }) => b.id)).toEqual(["c", "b"]);
     expect(got.body.blocks[0].data).toEqual({});
-    expect(await DocumentBlock.countDocuments({ documentId: id })).toBe(2);
+    // "a" stays as a tombstone for the changes feed.
+    expect(await DocumentBlock.countDocuments({ documentId: id, deleted: { $ne: true } })).toBe(2);
+    expect(await DocumentBlock.findOne({ documentId: id, blockId: "a" }).lean()).toMatchObject({
+      deleted: true,
+      rev: 4,
+    });
 
     // Pure reorder.
     const s4 = await api(alice, "PUT", `/documents/${id}/content`, {
@@ -146,7 +151,7 @@ describe("documents v2", () => {
       deletes: [],
     });
     expect(stale.status).toBe(409);
-    expect(stale.body).toEqual({ error: "revision_conflict", revision: 2 });
+    expect(stale.body).toEqual({ error: "revision_conflict", revision: 2, conflicts: ["a"] });
 
     const got = await api(alice, "GET", `/documents/${id}`);
     expect(got.body.revision).toBe(2);
@@ -275,7 +280,7 @@ describe("documents v2", () => {
     expect(got.body).toMatchObject({ title: "Doc", revision: 1, blocks: [] });
   });
 
-  it("PATCH returns meta without blocks and keeps the revision", async () => {
+  it("PATCH returns meta without blocks and bumps the revision", async () => {
     const { id } = await createDoc();
     await api(alice, "PUT", `/documents/${id}/content`, {
       baseRevision: 1,
@@ -297,7 +302,7 @@ describe("documents v2", () => {
     expect(res.body).toMatchObject({
       id,
       title: "Renamed",
-      revision: 2,
+      revision: 3,
       styles: { heading1: { fontSize: 32 } },
       pageSetup: { differentFirstPage: true, footnotes: { f1: "Note" } },
       headerBlocks: [para("h", "Header")],

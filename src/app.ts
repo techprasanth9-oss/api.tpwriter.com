@@ -7,6 +7,9 @@ import { secureHeaders } from "hono/secure-headers";
 import { env } from "./env";
 import { auth } from "./routes/auth";
 import { documents } from "./routes/documents";
+import { sharing } from "./routes/sharing";
+import { comments, notifications } from "./routes/comments";
+import { versions } from "./routes/versions";
 import { createPdfRoutes } from "./routes/pdf";
 import { uploads, UPLOAD_BODY_LIMIT } from "./routes/uploads";
 
@@ -61,6 +64,7 @@ export function createApp() {
   app.use("/documents/*", tooLarge(DOCUMENT_BODY_LIMIT));
   app.use("/documents", tooLarge(DOCUMENT_BODY_LIMIT));
   app.use("/uploads", tooLarge(UPLOAD_BODY_LIMIT));
+  app.use("/notifications/*", tooLarge(AUTH_BODY_LIMIT));
 
   app.get("/health", (c) =>
     c.json({ ok: true, service: "tp-writer-api", env: env.NODE_ENV }),
@@ -68,6 +72,11 @@ export function createApp() {
 
   app.route("/auth", auth);
   app.route("/documents", documents);
+  // Phase 6 collaboration: /documents/:id/{shares,link,comments,versions}.
+  app.route("/documents", sharing);
+  app.route("/documents", comments);
+  app.route("/documents", versions);
+  app.route("/notifications", notifications);
   // GET /pdf/status, POST /documents/:id/pdf
   app.route("/", createPdfRoutes());
   app.route("/uploads", uploads);

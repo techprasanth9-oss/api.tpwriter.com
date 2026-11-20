@@ -21,6 +21,10 @@ export interface RenderRequest {
   appUrl: string;
   /** API base URL when it's another origin (env.API_PUBLIC_URL). */
   apiUrl?: string;
+  /** Share-link token when the caller reads the document through its link;
+   *  passed to the print route as `?share=` (the FE sends it as the
+   *  X-Share-Token header). */
+  shareToken?: string;
   timeoutMs?: number;
 }
 
@@ -63,8 +67,9 @@ export function isAllowedRequest(url: string, allowedOrigins: ReadonlySet<string
 }
 
 /** Path-safe print URL for a document id (ids are ObjectIds; encode anyway). */
-export function printUrl(appUrl: string, documentId: string): string {
-  return `${appUrl}/documents/${encodeURIComponent(documentId)}/print`;
+export function printUrl(appUrl: string, documentId: string, shareToken?: string): string {
+  const base = `${appUrl}/documents/${encodeURIComponent(documentId)}/print`;
+  return shareToken ? `${base}?share=${encodeURIComponent(shareToken)}` : base;
 }
 
 // ── Shared browser ────────────────────────────────────────────────────
@@ -132,7 +137,7 @@ async function acquire(): Promise<() => void> {
 // ── Renderer ──────────────────────────────────────────────────────────
 
 export const chromiumRenderer: PdfRenderer = {
-  async render({ documentId, sessionToken, appUrl, apiUrl, timeoutMs = 30_000 }) {
+  async render({ documentId, sessionToken, appUrl, apiUrl, shareToken, timeoutMs = 30_000 }) {
     const release = await acquire();
     const deadline = Date.now() + timeoutMs;
     const remaining = () => Math.max(1, deadline - Date.now());
@@ -161,7 +166,7 @@ export const chromiumRenderer: PdfRenderer = {
         );
 
         const page = await context.newPage();
-        await page.goto(printUrl(appUrl, documentId), { waitUntil: "domcontentloaded", timeout: remaining() });
+        await page.goto(printUrl(appUrl, documentId, shareToken), { waitUntil: "domcontentloaded", timeout: remaining() });
         const status = await (
           await page.waitForFunction(
             // Runs in the page (no DOM types here).

@@ -1,6 +1,7 @@
 import type { Context, MiddlewareHandler } from "hono";
 import { getConnInfo } from "@hono/node-server/conninfo";
 import { env } from "../env";
+import type { AuthContext } from "../auth/middleware";
 
 interface Bucket {
   count: number;
@@ -60,4 +61,41 @@ function clientIp(c: Context): string {
   } catch {
     return "unknown";
   }
+}
+
+/**
+ * Fixed-window counter keyed by an arbitrary string (a user id). Returns
+ * null while under the limit, else the seconds until the window resets.
+ * In-memory, so per-process like `rateLimit`.
+ */
+export function userLimiter(windowMs: number, max: number) {
+  const buckets = new Map<string, Bucket>();
+  setInterval(() => {
+    const now = Date.now();
+    for (const [k, b] of buckets) if (b.resetAt <= now) buckets.delete(k);
+  }, windowMs).unref();
+  return (key: string): number | null => {
+    const now = Date.now();
+    let b = buckets.get(key);
+    if (!b || b.resetAt <= now) {
+      b = { count: 0, resetAt: now + windowMs };
+      buckets.set(key, b);
+    }
+    b.count += 1;
+    return b.count > max ? Math.ceil((b.resetAt - now) / 1000) : null;
+  };
+}
+
+/** Middleware form of `userLimiter`, keyed by the signed-in user. Mount
+ *  after requireAuth. */
+export function userRateLimit({ name, windowMs, max }: Options): MiddlewareHandler<AuthContext> {
+  const limit = userLimiter(windowMs, max);
+  return async (c, next) => {
+    const retryAfter = limit(`${name}:${c.get("session").userId}`);
+    if (retryAfter !== null) {
+      c.header("Retry-After", String(retryAfter));
+      return c.json({ error: "rate_limited", retryAfter }, 429);
+    }
+    await next();
+  };
 }

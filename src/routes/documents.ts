@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { vValidator } from "@hono/valibot-validator";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
-import mongoose, { Types, isValidObjectId } from "mongoose";
+import mongoose, { Types } from "mongoose";
 import {
   DEFAULT_LAYOUT,
   DocumentModel,
@@ -10,38 +10,66 @@ import {
 } from "../models/document";
 import { DocumentBlock, type DocumentBlockDoc } from "../models/documentBlock";
 import { DocumentPage } from "../models/documentPage";
-import { CURRENT_SCHEMA_VERSION, ensureV2 } from "../migrations/v2";
-import { requireAuth, type AuthContext } from "../auth/middleware";
+import { DocumentVersion } from "../models/documentVersion";
+import { CommentThread } from "../models/commentThread";
+import { Notification } from "../models/notification";
+import { CURRENT_SCHEMA_VERSION } from "../migrations/v2";
+import { requireAuth } from "../auth/middleware";
+import {
+  convertInvites,
+  memberRole,
+  requireDocRole,
+  type DocEnv,
+  type Role,
+} from "../auth/access";
+import { publicUser, publicUsers } from "../collab/users";
+import { colorFor, presence } from "../collab/presence";
+import { maybeAutoSnapshot } from "../collab/versions";
+import { purgeTombstones } from "../collab/tombstones";
 import {
   CreateDocumentInput,
   SaveContentInput,
   UpdateDocumentInput,
   type SaveContentInputT,
 } from "../schemas/documents";
+import { PresenceInput } from "../schemas/collab";
 
-export const documents = new Hono<AuthContext>();
+export const documents = new Hono<DocEnv>();
 
 documents.use("*", requireAuth);
 
-/** List this user's documents, newest-updated first. Blocks NOT included —
- *  only a count, computed in Mongo so we don't ship every blockOrder here. */
+/** The caller's own and shared documents, newest-updated first. Blocks NOT
+ *  included — only a count, computed in Mongo so we don't ship every
+ *  blockOrder here. Link-only access never lists a document. */
 documents.get("/", async (c) => {
   const session = c.get("session");
+  await convertInvites(session.userId, session.email);
+  const uid = new Types.ObjectId(session.userId);
   const rows = await DocumentModel.aggregate<ListRow>([
-    { $match: { ownerId: new Types.ObjectId(session.userId) } },
+    { $match: { $or: [{ ownerId: uid }, { "members.userId": uid }] } },
     { $sort: { updatedAt: -1 } },
     {
       $project: {
+        ownerId: 1,
+        members: 1,
         title: 1,
         defaultLayout: 1,
         createdAt: 1,
         updatedAt: 1,
-        // Legacy (unmigrated) docs have no blockOrder → 0.
+        // Legacy (unmigrated) docs have no blockOrder → 0. blockOrder only
+        // names live blocks, never tombstones.
         blockCount: { $size: { $ifNull: ["$blockOrder", []] } },
       },
     },
   ]);
-  return c.json(rows.map(toListDocResponse));
+  const owners = await publicUsers(rows.map((r) => r.ownerId));
+  return c.json(
+    rows.map((r) => ({
+      ...toListDocResponse(r),
+      role: memberRole(r, session.userId) ?? "viewer",
+      owner: publicUser(owners, r.ownerId),
+    })),
+  );
 });
 
 documents.post("/", vValidator("json", CreateDocumentInput), async (c) => {
@@ -57,30 +85,35 @@ documents.post("/", vValidator("json", CreateDocumentInput), async (c) => {
     blockOrder: [],
     styles: {},
     pageSetup: {},
+    members: [],
+    invites: [],
+    link: { enabled: false, role: "viewer", token: null },
+    orderRev: 1,
+    metaRev: 1,
+    commentsVersion: 0,
+    diffFloor: 0,
   });
 
   // A fresh doc has no blocks; the FE's editor starts from an empty list.
-  return c.json({ ...toMetaResponse(doc.toObject()), blocks: [] }, 201);
+  return c.json(
+    { ...toMetaResponse(doc.toObject()), blocks: [], role: "owner" satisfies Role },
+    201,
+  );
 });
 
-/** Full document: metadata + every block in order. Migrates legacy docs. */
-documents.get("/:id", async (c) => {
-  const session = c.get("session");
-  const doc = await loadOwnedDoc(c.req.param("id"), session.userId);
-  if (!doc) return c.json({ error: "not_found" }, 404);
-
-  return c.json(await toFullDocResponse(doc));
+/** Full document: metadata + every block in order + the caller's role. */
+documents.get("/:id", requireDocRole("viewer"), async (c) => {
+  return c.json({ ...(await toFullDocResponse(c.get("doc"))), role: c.get("role") });
 });
 
-/** Metadata-only update. Returns DocumentMeta (no blocks) and leaves
- *  `revision` alone — content goes through PUT /:id/content. */
+/** Metadata-only update (editor+). Returns DocumentMeta (no blocks). Bumps
+ *  `revision` and `metaRev` so other clients pick it up from /changes. */
 documents.patch(
   "/:id",
+  requireDocRole("editor"),
   vValidator("json", UpdateDocumentInput),
   async (c) => {
-    const session = c.get("session");
-    const doc = await loadOwnedDoc(c.req.param("id"), session.userId);
-    if (!doc) return c.json({ error: "not_found" }, 404);
+    const doc = c.get("doc");
     const patch = c.req.valid("json");
 
     const $set: Record<string, unknown> = {};
@@ -93,10 +126,17 @@ documents.patch(
     if (patch.styles !== undefined) $set.styles = patch.styles;
     if (patch.pageSetup !== undefined) $set.pageSetup = patch.pageSetup;
 
+    // Pipeline update so the revision bump is atomic with the write. Client
+    // values go through $literal: opaque objects (styles, pageSetup) may
+    // contain "$"-prefixed keys that would otherwise parse as expressions.
+    const next = { $add: [{ $ifNull: ["$revision", 1] }, 1] };
+    const literal = Object.fromEntries(
+      Object.entries($set).map(([k, v]) => [k, { $literal: v }]),
+    );
     const updated = await DocumentModel.findOneAndUpdate(
-      { _id: doc._id, ownerId: session.userId },
-      { $set },
-      { new: true },
+      { _id: doc._id },
+      [{ $set: { ...literal, revision: next, metaRev: next, updatedAt: "$$NOW" } }],
+      { new: true, timestamps: false },
     ).lean<DocumentDoc>();
     if (!updated) return c.json({ error: "not_found" }, 404);
 
@@ -104,15 +144,10 @@ documents.patch(
   },
 );
 
-documents.delete("/:id", async (c) => {
-  const session = c.get("session");
-  const id = c.req.param("id");
-  if (!isValidObjectId(id)) return c.json({ error: "not_found" }, 404);
-
-  const doc = await DocumentModel.findOneAndDelete({
-    _id: id,
-    ownerId: session.userId,
-  });
+/** Owner only. Cascades to blocks, legacy pages, versions, comments and
+ *  notifications. */
+documents.delete("/:id", requireDocRole("owner"), async (c) => {
+  const doc = await DocumentModel.findOneAndDelete({ _id: c.get("doc")._id });
   if (!doc) return c.json({ error: "not_found" }, 404);
 
   // Cascade by hand — Mongoose can't do this across collections without the
@@ -121,29 +156,38 @@ documents.delete("/:id", async (c) => {
   await Promise.all([
     DocumentBlock.deleteMany({ documentId: doc._id }),
     DocumentPage.deleteMany({ documentId: doc._id }),
+    DocumentVersion.deleteMany({ documentId: doc._id }),
+    CommentThread.deleteMany({ documentId: doc._id }),
+    Notification.deleteMany({ documentId: doc._id }),
   ]);
+  presence.clear(doc._id.toString());
 
   return c.body(null, 204);
 });
 
 /**
- * Incremental, atomic content save.
+ * Incremental, atomic content save (editor+).
  *
  * Body: `{ baseRevision, upserts, deletes, order? }`. `order` is the full new
  * block order; it may be omitted only when the save edits existing blocks in
  * place (no new ids, no deletes) — otherwise 400 order_required.
  *
- * Everything runs in one transaction: the conditional revision bump is the
- * first write, so a stale `baseRevision` (409) or any later validation
- * failure (400) aborts with nothing persisted.
+ * Block-level merge: a save from a stale `baseRevision` is still applied
+ * (`merged: true`) when none of its upserted / deleted blocks were written
+ * after baseRevision and, if it carries `order`, the order hasn't changed
+ * since either. Otherwise 409 `{ error: "revision_conflict", revision,
+ * conflicts }` listing the clashing block ids (and "order").
+ *
+ * Everything runs in one transaction whose first write is the revision
+ * bump, so concurrent saves serialise (write conflict → retry) and any
+ * 409 / 400 aborts with nothing persisted.
  */
 documents.put(
   "/:id/content",
+  requireDocRole("editor"),
   vValidator("json", SaveContentInput),
   async (c) => {
-    const session = c.get("session");
-    const doc = await loadOwnedDoc(c.req.param("id"), session.userId);
-    if (!doc) return c.json({ error: "not_found" }, 404);
+    const doc = c.get("doc");
     const input = c.req.valid("json");
 
     const invalid = checkContentInput(input);
@@ -151,9 +195,11 @@ documents.put(
 
     try {
       const saved = await saveContent(doc, input);
+      await maybeAutoSnapshot(doc._id, c.get("session").userId);
       return c.json({
         revision: saved.revision,
         updatedAt: saved.updatedAt.toISOString(),
+        ...(saved.merged ? { merged: true } : {}),
       });
     } catch (err) {
       if (err instanceof ContentSaveError) return c.json(err.body, err.status);
@@ -162,24 +208,76 @@ documents.put(
   },
 );
 
+/**
+ * Everything that changed after revision `since` (viewer+): live blocks
+ * written after it, tombstones after it as deletes, the order / meta if they
+ * changed, and the comments counter. `reset: true` when `since` is older than
+ * the oldest revision we can still diff from (purged tombstones, or deletes
+ * from before tombstones existed) — the client should reload.
+ */
+documents.get("/:id/changes", requireDocRole("viewer"), async (c) => {
+  const doc = c.get("doc");
+  const raw = c.req.query("since") ?? "";
+  if (!/^\d{1,15}$/.test(raw)) return c.json({ error: "invalid_since" }, 400);
+  const since = Number(raw);
+  const revision = doc.revision ?? 1;
+  if (since > revision) return c.json({ error: "since_ahead", revision }, 400);
+
+  const commentsVersion = doc.commentsVersion ?? 0;
+  if (since < (doc.diffFloor ?? revision)) {
+    return c.json({ revision, reset: true, upserts: [], deletes: [], commentsVersion });
+  }
+
+  // Bounded by `revision` so a save landing mid-request shows up whole in
+  // the next poll instead of half in this one.
+  const rows = since === revision
+    ? []
+    : await DocumentBlock.find(
+        { documentId: doc._id, rev: { $gt: since, $lte: revision } },
+        { blockId: 1, type: 1, data: 1, tunes: 1, deleted: 1, rev: 1 },
+      )
+        .sort({ rev: 1 })
+        .lean();
+
+  return c.json({
+    revision,
+    upserts: rows.filter((r) => !r.deleted).map(toBlockResponse),
+    deletes: rows.filter((r) => r.deleted).map((r) => r.blockId),
+    ...((doc.orderRev ?? 0) > since ? { order: doc.blockOrder ?? [] } : {}),
+    ...((doc.metaRev ?? 0) > since ? { meta: toMetaResponse(doc) } : {}),
+    commentsVersion,
+  });
+});
+
+/** Presence heartbeat (viewer+): returns everyone else on the document. */
+documents.post(
+  "/:id/presence",
+  requireDocRole("viewer"),
+  vValidator("json", PresenceInput),
+  async (c) => {
+    const { state, blockId } = c.req.valid("json");
+    const others = presence.heartbeat(
+      c.get("doc")._id.toString(),
+      c.get("session").userId,
+      state,
+      blockId,
+    );
+    const users = await publicUsers(others.map((e) => e.userId));
+    return c.json({
+      present: others.map((e) => ({
+        ...publicUser(users, e.userId),
+        state: e.state,
+        blockId: e.blockId,
+        color: colorFor(e.userId),
+        lastSeen: new Date(e.lastSeen).toISOString(),
+      })),
+    });
+  },
+);
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
-
-/** Owned doc by id, migrated to v2. `null` → respond 404 (missing, malformed
- *  id, or owned by someone else — indistinguishable on purpose). */
-async function loadOwnedDoc(
-  id: string,
-  userId: string,
-): Promise<DocumentDoc | null> {
-  if (!isValidObjectId(id)) return null;
-  const doc = await DocumentModel.findOne({
-    _id: id,
-    ownerId: userId,
-  }).lean<DocumentDoc>();
-  if (!doc) return null;
-  return ensureV2(doc);
-}
 
 /** Thrown inside the content-save transaction to abort it; mapped to an
  *  HTTP response outside. */
@@ -209,13 +307,42 @@ function checkContentInput(input: SaveContentInputT): string | null {
   return null;
 }
 
+type SavePre = Pick<DocumentDoc, "_id" | "revision" | "orderRev" | "diffFloor">;
+
+/** Block ids (and "order") this stale save would clobber. */
+async function findConflicts(
+  documentId: Types.ObjectId,
+  pre: SavePre,
+  input: SaveContentInputT,
+  tx: mongoose.ClientSession,
+): Promise<string[]> {
+  const current = pre.revision ?? 1;
+  const ids = [...input.upserts.map((b) => b.id), ...input.deletes];
+  const base = input.baseRevision;
+  // A base from the future, or older than what we can still diff from
+  // (tombstones purged / pre-tombstone deletes): can't prove it's safe.
+  if (base > current || base < (pre.diffFloor ?? current)) {
+    return [...ids, ...(input.order ? ["order"] : [])];
+  }
+  const changed: string[] = ids.length
+    ? await DocumentBlock.distinct("blockId", {
+        documentId,
+        blockId: { $in: ids },
+        rev: { $gt: base },
+      }).session(tx)
+    : [];
+  const conflicts = ids.filter((id) => changed.includes(id));
+  if (input.order && (pre.orderRev ?? 0) > base) conflicts.push("order");
+  return conflicts;
+}
+
 async function saveContent(
   doc: DocumentDoc,
   input: SaveContentInputT,
-): Promise<{ revision: number; updatedAt: Date }> {
+): Promise<{ revision: number; updatedAt: Date; merged: boolean }> {
   const documentId = doc._id;
   const upsertIds = input.upserts.map((b) => b.id);
-  let result: { revision: number; updatedAt: Date } | undefined;
+  let result: { revision: number; updatedAt: Date; merged: boolean } | undefined;
 
   const tx = await mongoose.startSession();
   try {
@@ -223,40 +350,43 @@ async function saveContent(
     // conflict with a concurrent save), so it must not leak state between
     // attempts — `result` is only assigned on the success path.
     await tx.withTransaction(async () => {
-      const $set: Record<string, unknown> = { updatedAt: new Date() };
-      if (input.order) $set.blockOrder = input.order;
-
-      const bumped = await DocumentModel.findOneAndUpdate(
-        { _id: documentId, ownerId: doc.ownerId, revision: input.baseRevision },
-        { $inc: { revision: 1 }, $set },
+      const updatedAt = new Date();
+      // First write: claims the document for this transaction. Returns the
+      // pre-image so we know which revision we're building on.
+      const pre = await DocumentModel.findOneAndUpdate(
+        { _id: documentId },
+        { $inc: { revision: 1 }, $set: { updatedAt } },
         {
           session: tx,
-          new: true,
+          new: false,
           timestamps: false,
-          projection: { revision: 1, updatedAt: 1 },
+          projection: { revision: 1, orderRev: 1, diffFloor: 1 },
         },
-      ).lean<Pick<DocumentDoc, "revision" | "updatedAt">>();
+      ).lean<SavePre>();
+      if (!pre) throw new ContentSaveError(404, { error: "not_found" });
+      const current = pre.revision ?? 1;
+      const rev = current + 1;
 
-      if (!bumped) {
-        const current = await DocumentModel.findOne(
-          { _id: documentId, ownerId: doc.ownerId },
-          { revision: 1 },
-        )
-          .session(tx)
-          .lean<Pick<DocumentDoc, "revision">>();
-        if (!current) throw new ContentSaveError(404, { error: "not_found" });
-        throw new ContentSaveError(409, {
-          error: "revision_conflict",
-          revision: current.revision,
-        });
+      let merged = false;
+      if (input.baseRevision !== current) {
+        const conflicts = await findConflicts(documentId, pre, input, tx);
+        if (conflicts.length > 0) {
+          throw new ContentSaveError(409, {
+            error: "revision_conflict",
+            revision: current,
+            conflicts,
+          });
+        }
+        merged = true;
       }
 
-      // Without `order`, the block set must not change: every upsert has to
-      // be an edit of a block that already exists.
+      // Without `order`, the live block set must not change: every upsert
+      // has to be an edit of a block that exists (and isn't a tombstone).
       if (!input.order && upsertIds.length > 0) {
         const existing = await DocumentBlock.countDocuments({
           documentId,
           blockId: { $in: upsertIds },
+          deleted: { $ne: true },
         }).session(tx);
         if (existing !== upsertIds.length) {
           throw new ContentSaveError(400, { error: "order_required" });
@@ -274,6 +404,8 @@ async function saveContent(
                   type: b.type,
                   data: b.data,
                   tunes: b.tunes,
+                  rev,
+                  deleted: false,
                 },
               },
               upsert: true,
@@ -284,23 +416,32 @@ async function saveContent(
       }
 
       if (input.deletes.length > 0) {
-        await DocumentBlock.deleteMany(
-          { documentId, blockId: { $in: input.deletes } },
+        await DocumentBlock.updateMany(
+          { documentId, blockId: { $in: input.deletes }, deleted: { $ne: true } },
+          { $set: { deleted: true, rev, data: {}, tunes: null } },
           { session: tx },
         );
       }
 
-      // `order` must name exactly the blocks that exist after this save.
+      // `order` must name exactly the live blocks after this save.
       if (input.order) {
         const actual: string[] = await DocumentBlock.distinct("blockId", {
           documentId,
+          deleted: { $ne: true },
         }).session(tx);
         if (!sameSet(actual, input.order)) {
           throw new ContentSaveError(400, { error: "order_mismatch" });
         }
+        await DocumentModel.updateOne(
+          { _id: documentId },
+          { $set: { blockOrder: input.order, orderRev: rev } },
+          { session: tx, timestamps: false },
+        );
       }
 
-      result = { revision: bumped.revision!, updatedAt: bumped.updatedAt };
+      await purgeTombstones(documentId, rev, pre.diffFloor, tx);
+
+      result = { revision: rev, updatedAt, merged };
     });
   } finally {
     await tx.endSession();
@@ -321,7 +462,7 @@ function sameSet(a: string[], b: string[]): boolean {
 // Response serialisers — one place to control what we expose to clients.
 // ─────────────────────────────────────────────────────────────────────────────
 
-interface ListRow {
+interface ListRow extends Pick<DocumentDoc, "ownerId" | "members"> {
   _id: unknown;
   title: string;
   defaultLayout: PageLayout;
@@ -341,7 +482,7 @@ function toListDocResponse(d: ListRow) {
   };
 }
 
-function toMetaResponse(doc: DocumentDoc) {
+export function toMetaResponse(doc: DocumentDoc) {
   return {
     id: doc._id.toString(),
     title: doc.title,
@@ -358,7 +499,7 @@ function toMetaResponse(doc: DocumentDoc) {
 
 async function toFullDocResponse(doc: DocumentDoc) {
   const rows = await DocumentBlock.find(
-    { documentId: doc._id },
+    { documentId: doc._id, deleted: { $ne: true } },
     { blockId: 1, type: 1, data: 1, tunes: 1 },
   ).lean();
   const byId = new Map(rows.map((r) => [r.blockId, r]));
@@ -370,7 +511,7 @@ async function toFullDocResponse(doc: DocumentDoc) {
   return { ...toMetaResponse(doc), blocks };
 }
 
-function toBlockResponse(
+export function toBlockResponse(
   b: Pick<DocumentBlockDoc, "blockId" | "type" | "data" | "tunes">,
 ) {
   return {

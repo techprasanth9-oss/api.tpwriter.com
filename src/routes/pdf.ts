@@ -1,10 +1,10 @@
 import { Hono } from "hono";
 import { getCookie } from "hono/cookie";
-import { isValidObjectId } from "mongoose";
 import { env } from "../env";
 import { requireAuth, type AuthContext } from "../auth/middleware";
 import { SESSION_COOKIE } from "../auth/jwt";
-import { DocumentModel } from "../models/document";
+import { atLeast, linkRole, loadDocAccess, memberRole, SHARE_TOKEN_HEADER } from "../auth/access";
+import { userLimiter } from "../middleware/rateLimit";
 import {
   chromiumRenderer,
   RenderFailedError,
@@ -15,25 +15,6 @@ import {
 const RATE_WINDOW_MS = 60_000;
 const RATE_MAX = 10;
 const RENDER_TIMEOUT_MS = 30_000;
-
-/** Fixed-window limiter keyed by user id (PDF renders are expensive). */
-function userLimiter(windowMs: number, max: number) {
-  const buckets = new Map<string, { count: number; resetAt: number }>();
-  setInterval(() => {
-    const now = Date.now();
-    for (const [k, b] of buckets) if (b.resetAt <= now) buckets.delete(k);
-  }, windowMs).unref();
-  return (key: string): number | null => {
-    const now = Date.now();
-    let b = buckets.get(key);
-    if (!b || b.resetAt <= now) {
-      b = { count: 0, resetAt: now + windowMs };
-      buckets.set(key, b);
-    }
-    b.count += 1;
-    return b.count > max ? Math.ceil((b.resetAt - now) / 1000) : null;
-  };
-}
 
 /** `Content-Disposition` for a download named after the document. */
 export function pdfDisposition(title: string): string {
@@ -69,11 +50,13 @@ export function createPdfRoutes(renderer: PdfRenderer = chromiumRenderer) {
     }
 
     const id = c.req.param("id");
-    if (!isValidObjectId(id)) return c.json({ error: "not_found" }, 404);
-    const doc = await DocumentModel.findOne({ _id: id, ownerId: session.userId })
-      .select({ title: 1 })
-      .lean<{ _id: unknown; title: string }>();
-    if (!doc) return c.json({ error: "not_found" }, 404);
+    // Viewer+ — the same access check as every document route.
+    const shareToken = c.req.header(SHARE_TOKEN_HEADER) || undefined;
+    const access = await loadDocAccess(id, session, shareToken);
+    if (!access || !atLeast(access.role, "viewer")) return c.json({ error: "not_found" }, 404);
+    const { doc } = access;
+    // A link-only reader needs the token on the print page too.
+    const viaLink = !memberRole(doc, session.userId) && !!linkRole(doc, shareToken);
 
     try {
       const bytes = await renderer.render({
@@ -82,6 +65,7 @@ export function createPdfRoutes(renderer: PdfRenderer = chromiumRenderer) {
         sessionToken: getCookie(c, SESSION_COOKIE)!,
         appUrl,
         apiUrl: env.API_PUBLIC_URL,
+        ...(viaLink ? { shareToken } : {}),
         timeoutMs: RENDER_TIMEOUT_MS,
       });
       return c.body(bytes as Uint8Array<ArrayBuffer>, 200, {

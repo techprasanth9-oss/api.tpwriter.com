@@ -58,6 +58,29 @@ const layoutSchema = new Schema<PageLayout>(
   { _id: false },
 );
 
+/** Roles a document can be shared with (the owner is implicit). */
+export type ShareRole = "viewer" | "commenter" | "editor";
+export const SHARE_ROLES = ["viewer", "commenter", "editor"] as const;
+
+export interface DocumentMember {
+  userId: Types.ObjectId;
+  role: ShareRole;
+}
+
+/** Pending share with someone who has no account yet; becomes a member the
+ *  first time a user with that email signs in or opens anything. */
+export interface DocumentInvite {
+  email: string;
+  role: ShareRole;
+}
+
+export interface DocumentLink {
+  enabled: boolean;
+  role: ShareRole;
+  // 24 random bytes, base64url. Cleared on disable so re-enabling rotates it.
+  token: string | null;
+}
+
 export interface DocumentDoc {
   _id: Types.ObjectId;
   ownerId: Types.ObjectId;
@@ -82,6 +105,23 @@ export interface DocumentDoc {
   // and below each page canvas.
   headerBlocks: unknown[];
   footerBlocks: unknown[];
+  // ── Sharing (Phase 6) ──
+  members?: DocumentMember[];
+  invites?: DocumentInvite[];
+  link?: DocumentLink;
+  // ── Collaboration (Phase 6). All optional on disk: docs written before
+  // Phase 6 lack them, and readers treat a missing value as 0 (except
+  // `diffFloor`, see src/auth/access.ts `upgradeCollab`). ──
+  // Revision at which blockOrder last changed.
+  orderRev?: number;
+  // Revision at which title / layout / headers / pageSetup / styles last
+  // changed (PATCH bumps `revision` too, so clients see it in /changes).
+  metaRev?: number;
+  // +1 on every comment change; clients refetch comments when it moves.
+  commentsVersion?: number;
+  // Oldest revision /changes can diff from. Tombstones at or below it may
+  // have been purged; deletes before Phase 6 left no tombstones at all.
+  diffFloor?: number;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -126,6 +166,45 @@ const documentSchema = new Schema<DocumentDoc>(
       type: [Schema.Types.Mixed],
       default: [],
     },
+    members: {
+      type: [
+        new Schema<DocumentMember>(
+          {
+            userId: { type: Schema.Types.ObjectId, ref: "User", required: true },
+            role: { type: String, enum: SHARE_ROLES, required: true },
+          },
+          { _id: false },
+        ),
+      ],
+      default: undefined,
+    },
+    invites: {
+      type: [
+        new Schema<DocumentInvite>(
+          {
+            email: { type: String, required: true, lowercase: true, trim: true },
+            role: { type: String, enum: SHARE_ROLES, required: true },
+          },
+          { _id: false },
+        ),
+      ],
+      default: undefined,
+    },
+    link: {
+      type: new Schema<DocumentLink>(
+        {
+          enabled: { type: Boolean, default: false },
+          role: { type: String, enum: SHARE_ROLES, default: "viewer" },
+          token: { type: String, default: null },
+        },
+        { _id: false },
+      ),
+      default: undefined,
+    },
+    orderRev: { type: Number },
+    metaRev: { type: Number },
+    commentsVersion: { type: Number },
+    diffFloor: { type: Number },
   },
   {
     timestamps: true,
@@ -137,6 +216,9 @@ const documentSchema = new Schema<DocumentDoc>(
 
 // Common query: "list this user's docs by most recently updated".
 documentSchema.index({ ownerId: 1, updatedAt: -1 });
+// "Documents shared with me" and invite conversion at sign-in.
+documentSchema.index({ "members.userId": 1 });
+documentSchema.index({ "invites.email": 1 });
 
 export const DocumentModel: Model<DocumentDoc> = model<DocumentDoc>(
   "Document",

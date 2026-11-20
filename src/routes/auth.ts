@@ -10,6 +10,7 @@ import {
   signSession,
 } from "../auth/jwt";
 import { requireAuth, type AuthContext } from "../auth/middleware";
+import { convertInvites } from "../auth/access";
 import { rateLimit } from "../middleware/rateLimit";
 import { LoginInput, SignupInput } from "../schemas/auth";
 
@@ -35,6 +36,7 @@ auth.post("/signup", signupLimit, vValidator("json", SignupInput), async (c) => 
     throw err;
   });
   if (!created) return c.json({ error: "email_taken" }, 409);
+  await acceptInvites(created._id.toString(), created.email);
 
   setSessionCookieOn(
     c,
@@ -51,6 +53,7 @@ auth.post("/login", loginLimit, vValidator("json", LoginInput), async (c) => {
 
   const ok = await verifyPassword(password, user.passwordHash);
   if (!ok) return c.json({ error: "invalid_credentials" }, 401);
+  await acceptInvites(user._id.toString(), user.email);
 
   setSessionCookieOn(
     c,
@@ -70,6 +73,16 @@ auth.get("/me", requireAuth, async (c) => {
   if (!user) return c.json({ error: "unauthorized" }, 401);
   return c.json(toPublic(user));
 });
+
+/** Pending document invites for this email become memberships. Never
+ *  fails the sign-in: the next document access converts them anyway. */
+async function acceptInvites(userId: string, email: string) {
+  try {
+    await convertInvites(userId, email);
+  } catch (err) {
+    console.error("[tp-writer-api] converting invites failed:", err);
+  }
+}
 
 function toPublic(u: {
   _id: { toString(): string };

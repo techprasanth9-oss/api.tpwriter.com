@@ -13,6 +13,7 @@ import { env } from "../env";
 import { SESSION_COOKIE, signSession } from "../auth/jwt";
 import { isAllowedRequest, printUrl, RenderFailedError, RenderTimeoutError } from "../pdf/renderer";
 import { pdfDisposition } from "./pdf";
+import { api as helperApi, app as helperApp, makeUser, share } from "../test/helpers";
 
 const app = createApp();
 const alice = new Types.ObjectId().toString();
@@ -100,6 +101,41 @@ describe("PDF export", () => {
       appUrl: "http://app.test",
       apiUrl: "http://api.test",
     });
+  });
+
+  it("lets shared users (viewer+) and link holders export; passes the link token on", async () => {
+    const owner = await makeUser();
+    const viewer = await makeUser();
+    const linkUser = await makeUser();
+    const id = await createDoc(owner.id);
+    // Users need real rows for email-based sharing; sessions carry the email.
+    await share(owner, id, viewer.email, "viewer");
+    const link = await helperApi(owner, "PUT", `/documents/${id}/link`, { enabled: true, role: "viewer" });
+    const token = link.body.link.token as string;
+
+    const asViewer = await helperApp.request(`/documents/${id}/pdf`, {
+      method: "POST",
+      headers: { Cookie: `${SESSION_COOKIE}=${signSession({ userId: viewer.id, email: viewer.email })}` },
+    });
+    expect(asViewer.status).toBe(200);
+    expect(render.mock.calls[0]![0].shareToken).toBeUndefined();
+
+    const asLink = await helperApp.request(`/documents/${id}/pdf`, {
+      method: "POST",
+      headers: {
+        Cookie: `${SESSION_COOKIE}=${signSession({ userId: linkUser.id, email: linkUser.email })}`,
+        "X-Share-Token": token,
+      },
+    });
+    expect(asLink.status).toBe(200);
+    expect(render.mock.calls[1]![0]).toMatchObject({ documentId: id, shareToken: token });
+    expect(printUrl("http://app.test", id, token)).toBe(`http://app.test/documents/${id}/print?share=${token}`);
+
+    const noToken = await helperApp.request(`/documents/${id}/pdf`, {
+      method: "POST",
+      headers: { Cookie: `${SESSION_COOKIE}=${signSession({ userId: linkUser.id, email: linkUser.email })}` },
+    });
+    expect(noToken.status).toBe(404);
   });
 
   it("maps renderer failures", async () => {
